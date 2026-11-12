@@ -1,5 +1,9 @@
 # 💬 `monku.nvim`
 
+> [!WARNING]
+> This is AI vibecoded software written for my own personal use. It is not built for sharing openly: expect
+> bugs and breaking changes, and no support.
+
 Leave review comments on code as you read it, then send them all to a coding agent.
 
 - comments are anchored to lines and follow your edits
