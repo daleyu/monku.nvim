@@ -6,9 +6,11 @@
 
 Leave review comments on code as you read it, then send them all to a coding agent.
 
-- comments are anchored to lines and follow your edits
+- comments are anchored to lines, or to an exact span of text, and follow your edits
 - shown inline under the code, on hover or all at once
 - sent to an agent in your [Herdr](https://herdr.dev) workspace, or copied to the clipboard
+
+![Two span comments and a line comment shown inline under the code](assets/span-comments.png)
 
 ## ⚡️ Requirements
 
@@ -49,7 +51,8 @@ Install with [lazy.nvim](https://github.com/folke/lazy.nvim):
   auto_expand = true, -- show a comment inline while the cursor is on its line
   clear_on_submit = true, -- drop the comments once the agent has accepted them
   sign = "▍",
-  colors = { sign = "#7287b8", border = "#7287b8", text = "#8c9bc4" },
+  -- sign, border and text are foreground colors; span is the background behind a commented span
+  colors = { sign = "#7287b8", border = "#7287b8", text = "#8c9bc4", span = "#333850" },
   max_snippet_lines = 30,
 }
 ```
@@ -60,7 +63,7 @@ Install with [lazy.nvim](https://github.com/folke/lazy.nvim):
 
 | Command | Description |
 | --- | --- |
-| `:Monku add` | Comment on the current line or visual selection |
+| `:Monku add` | Comment on the current line or visual selection (see below) |
 | `:Monku general` | Add a comment not tied to a line |
 | `:Monku edit` / `delete` | Edit or delete the comment under the cursor |
 | `:Monku next` / `prev` | Jump between comments in the file |
@@ -70,3 +73,52 @@ Install with [lazy.nvim](https://github.com/folke/lazy.nvim):
 | `:Monku submit` | Send all comments to the agent |
 | `:Monku clear` | Delete all comments |
 | `:Monku delmarks` | Delete all Vim marks |
+
+### Commenting on a selection
+
+What a comment is anchored to depends on how you select:
+
+| Selection | Anchor |
+| --- | --- |
+| none (normal mode) | the current line |
+| `V` (linewise) | the selected lines |
+| `v` (characterwise) | exactly the selected text: part of a line, or a span that starts and ends mid-line |
+| `<C-v>` (blockwise) | the lines the block touches (same as `V`) |
+
+This holds whether you add through a mapping that calls `require("monku").add()`, `:'<,'>Monku add`, or the
+`:Monku` menu. An explicit range such as `:3,5Monku add` comments on whole lines, unless it is exactly the lines
+of your last `v` selection, which is how `:'<,'>` arrives.
+
+Adding a comment after selecting `sum * TAX_RATE` with `v`; the title shows the line and column range:
+
+![The comment input open under a characterwise selection](assets/span-add.png)
+
+A span is highlighted in the buffer with `MonkuSpan` (`colors.span`) and tracks edits like a line comment. When
+the cursor is inside a span, hover, `edit` and `delete` act on that comment, so several spans can share a line.
+
+`copy` and `submit` quote only the selected text and give its position as `file:line:col-col` (or
+`file:line:col-line:col` across lines), in 1-based character columns with the end inclusive:
+
+````markdown
+## 1. lua/cart.lua:9:17-42
+```lua
+item.price * item.quantity
+```
+Round each line total to cents before adding it up
+
+## 2. lua/cart.lua:11:16-29
+```lua
+sum * TAX_RATE
+```
+Pull the tax calculation into its own function so discount() can reuse it
+
+## 3. lua/cart.lua:16-17
+```lua
+  local reduced = amount - amount * percent / 100
+  return math.max(reduced, 0)
+```
+Reject a percent above 100 here rather than clamping the result
+````
+
+The first two are spans and the third is a line comment; this is the output for the comments in the
+screenshot at the top.

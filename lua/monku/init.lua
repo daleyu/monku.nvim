@@ -2,7 +2,7 @@
 --
 -- Comments are anchored with extmarks (so they follow edits), persisted per project as JSON, shown inline
 -- below the commented lines, and delivered either to an agent pane in the current Herdr workspace or to the
--- clipboard.
+-- clipboard. A comment covers whole lines, or (added from characterwise visual mode) an exact span of text.
 
 local api = vim.api
 
@@ -16,10 +16,12 @@ local config = {
         clear_on_submit = true,
         sign = "▍",
         -- Foreground colors: the gutter sign, the bar beside an inline comment, and the comment text.
+        -- `span` is the background behind a commented span of text.
         colors = {
                 sign = "#7287b8",
                 border = "#7287b8",
                 text = "#8c9bc4",
+                span = "#333850",
         },
         max_snippet_lines = 30,
         intro = "Please address the following %d code review comment(s). Paths are relative to %s. "
@@ -36,8 +38,10 @@ local ns_input = api.nvim_create_namespace("monku/input")
 ---@field file string path relative to the project root; "" for a general comment
 ---@field lnum integer
 ---@field end_lnum integer
+---@field col integer? span comments only: 0-based character column in `lnum` where the span starts
+---@field end_col integer? span comments only: 0-based character column in `end_lnum` where it ends (exclusive)
 ---@field text string
----@field snippet string[]
+---@field snippet string[] the commented lines, or just the text of the span
 
 ---@type table<string, { comments: MonkuComment[], next_id: integer }>
 local stores = {}
@@ -119,16 +123,66 @@ local function mark_range(buf, mark)
                 return nil
         end
         local s = pos[1] + 1
-        return s, math.max(s, (pos[3].end_row or pos[1]) + 1)
+        return s, math.max(s, (pos[3].end_row or pos[1]) + 1), pos[2], pos[3].end_col or pos[2]
+end
+
+local function line_text(buf, lnum)
+        return api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
+end
+
+-- A comment's position as shown to people and agents: "12", "12-14", or for a span "12:5-17" / "12:5-14:9"
+-- (1-based character columns, end inclusive).
+local function location(c)
+        if not c.col then
+                return c.lnum == c.end_lnum and tostring(c.lnum) or ("%d-%d"):format(c.lnum, c.end_lnum)
+        end
+        if c.lnum ~= c.end_lnum then
+                return ("%d:%d-%d:%d"):format(c.lnum, c.col + 1, c.end_lnum, math.max(c.end_col, 1))
+        end
+        return c.end_col > c.col + 1 and ("%d:%d-%d"):format(c.lnum, c.col + 1, c.end_col)
+                or ("%d:%d"):format(c.lnum, c.col + 1)
+end
+
+-- The span between two `getpos()` positions of a characterwise selection, as line1, line2, col, end_col
+-- (columns as stored on a comment). Only the lines come back when no text is selected (an empty line).
+local function span(buf, p1, p2)
+        if p1[2] > p2[2] or (p1[2] == p2[2] and p1[3] > p2[3]) then
+                p1, p2 = p2, p1
+        end
+        local first, last = line_text(buf, p1[2]), line_text(buf, p2[2])
+        -- Byte columns. `'>` can lie past the end of the line (after `$`), and it sits on the first byte of
+        -- the last selected character.
+        local col = math.min(p1[3] - 1, #first)
+        local end_col = math.min(p2[3] - 1, #last)
+        if vim.o.selection ~= "exclusive" and end_col < #last then
+                end_col = end_col + 1 + vim.str_utf_end(last, end_col + 1)
+        end
+        if p1[2] == p2[2] and end_col <= col then
+                return p1[2], p2[2]
+        end
+        return p1[2],
+                p2[2],
+                vim.str_utfindex(first, "utf-32", col, false),
+                vim.str_utfindex(last, "utf-32", end_col, false)
 end
 
 local function place(buf, comment)
         local count = api.nvim_buf_line_count(buf)
         local s = math.min(math.max(comment.lnum, 1), count)
         local e = math.min(math.max(comment.end_lnum, s), count)
-        bufs[buf].marks[comment.id] = api.nvim_buf_set_extmark(buf, ns, s - 1, 0, {
+        local col, end_col = 0, 0
+        if comment.col then
+                -- Stored columns count characters; the file may have changed since, so clamp to the line.
+                col = vim.str_byteindex(line_text(buf, s), "utf-32", comment.col, false)
+                end_col = vim.str_byteindex(line_text(buf, e), "utf-32", comment.end_col, false)
+                if s == e then
+                        end_col = math.max(col, end_col)
+                end
+        end
+        bufs[buf].marks[comment.id] = api.nvim_buf_set_extmark(buf, ns, s - 1, col, {
                 end_row = e - 1,
-                end_col = 0,
+                end_col = end_col,
+                hl_group = comment.col and "MonkuSpan" or nil,
                 sign_text = config.sign,
                 sign_hl_group = "MonkuSign",
         })
@@ -142,13 +196,23 @@ local function sync(buf)
         end
         for _, comment in ipairs(load_store(info.root).comments) do
                 local mark = info.marks[comment.id]
-                local s, e = nil, nil
+                local s, e, col, end_col = nil, nil, nil, nil
                 if mark then
-                        s, e = mark_range(buf, mark)
+                        s, e, col, end_col = mark_range(buf, mark)
                 end
                 if s then
                         comment.lnum, comment.end_lnum = s, e
-                        comment.snippet = api.nvim_buf_get_lines(buf, s - 1, e, false)
+                        if comment.col then
+                                local first, last = line_text(buf, s), line_text(buf, e)
+                                col, end_col = math.min(col, #first), math.min(end_col, #last)
+                                comment.col = vim.str_utfindex(first, "utf-32", col, false)
+                                comment.end_col = vim.str_utfindex(last, "utf-32", end_col, false)
+                                local text = api.nvim_buf_get_text(buf, s - 1, col, e - 1, end_col, {})
+                                -- Nothing is left to quote once the span's text has been deleted.
+                                comment.snippet = table.concat(text) == "" and {} or text
+                        else
+                                comment.snippet = api.nvim_buf_get_lines(buf, s - 1, e, false)
+                        end
                 end
         end
 end
@@ -264,20 +328,27 @@ local function attach(buf)
         return bufs[buf]
 end
 
-local function comment_at(buf, lnum)
+-- The comment at the cursor: a span the cursor is inside if there is one, else the first comment on its line.
+local function comment_at(buf)
         local info = bufs[buf]
         if not info then
                 return nil
         end
+        local lnum, cur = unpack(api.nvim_win_get_cursor(0))
+        local found
         for _, comment in ipairs(load_store(info.root).comments) do
                 local mark = info.marks[comment.id]
                 if mark then
-                        local s, e = mark_range(buf, mark)
+                        local s, e, col, end_col = mark_range(buf, mark)
                         if s and lnum >= s and lnum <= e then
-                                return comment
+                                if comment.col and (lnum > s or cur >= col) and (lnum < e or cur < end_col) then
+                                        return comment
+                                end
+                                found = found or comment
                         end
                 end
         end
+        return found
 end
 
 local function update_hover(buf)
@@ -285,7 +356,7 @@ local function update_hover(buf)
         if not info then
                 return
         end
-        local comment = comment_at(buf, api.nvim_win_get_cursor(0)[1])
+        local comment = comment_at(buf)
         local id = comment and comment.id or nil
         if info.hover ~= id then
                 info.hover = id
@@ -469,9 +540,10 @@ end
 
 -- Public API ----------------------------------------------------------------------------------------------
 
----Create a comment without prompting.
+---Create a comment without prompting. With `col` and `end_col` (0-based character columns, end exclusive) it
+---is anchored to the span from `col` in `lnum` up to `end_col` in `end_lnum`, otherwise to the whole lines.
 ---@return MonkuComment?
-function M.create(buf, lnum, end_lnum, text)
+function M.create(buf, lnum, end_lnum, text, col, end_col)
         local info = bufs[buf] or attach(buf)
         if not info then
                 notify("This buffer is not a file, so it cannot be commented on", vim.log.levels.WARN)
@@ -483,12 +555,17 @@ function M.create(buf, lnum, end_lnum, text)
                 file = info.file,
                 lnum = lnum,
                 end_lnum = end_lnum,
+                col = end_col and col or nil,
+                end_col = col and end_col or nil,
                 text = text,
                 snippet = api.nvim_buf_get_lines(buf, lnum - 1, end_lnum, false),
         }
         store.next_id = store.next_id + 1
         store.comments[#store.comments + 1] = comment
         place(buf, comment)
+        if comment.col then
+                sync(buf)
+        end
         save_store(info.root)
         if buf == api.nvim_get_current_buf() then
                 info.hover = nil
@@ -498,14 +575,29 @@ function M.create(buf, lnum, end_lnum, text)
         return comment
 end
 
----Comment on the current line, the visual selection, or an explicit line range.
-function M.add(line1, line2)
+-- Leave visual mode and return what was selected: line1, line2, and for a characterwise selection the span's
+-- col and end_col. Linewise and blockwise selections give only their lines. Nil outside visual mode.
+local function take_selection()
+        local mode = vim.fn.mode()
+        if not mode:match("^[vV\22]") then
+                return nil
+        end
+        local p1, p2 = vim.fn.getpos("v"), vim.fn.getpos(".")
+        api.nvim_feedkeys(vim.keycode("<Esc>"), "nx", false)
+        if mode == "v" then
+                return span(api.nvim_get_current_buf(), p1, p2)
+        end
+        return p1[2], p2[2]
+end
+
+---Comment on the current line, the visual selection, or an explicit line range (a span of text when `col`
+---and `end_col` are given, as for `M.create`).
+function M.add(line1, line2, col, end_col)
         local buf = api.nvim_get_current_buf()
         if not line1 then
-                line1, line2 = vim.fn.line("."), vim.fn.line(".")
-                if vim.fn.mode():match("^[vV\22]") then
-                        line1, line2 = vim.fn.line("v"), vim.fn.line(".")
-                        api.nvim_feedkeys(vim.keycode("<Esc>"), "nx", false)
+                line1, line2, col, end_col = take_selection()
+                if not line1 then
+                        line1, line2 = vim.fn.line("."), vim.fn.line(".")
                 end
         end
         if line1 > line2 then
@@ -515,12 +607,12 @@ function M.add(line1, line2)
                 notify("This buffer is not a file, so it cannot be commented on", vim.log.levels.WARN)
                 return
         end
-        local range = line1 == line2 and ("L" .. line1) or ("L%d-%d"):format(line1, line2)
+        local range = location({ lnum = line1, end_lnum = line2, col = end_col and col, end_col = end_col })
         open_input({
-                title = "Review comment · " .. range,
+                title = "Review comment · L" .. range,
                 line = line2,
                 on_submit = function(text)
-                        M.create(buf, line1, line2, text)
+                        M.create(buf, line1, line2, text, col, end_col)
                 end,
         })
 end
@@ -558,7 +650,7 @@ end
 
 function M.edit()
         local buf = api.nvim_get_current_buf()
-        local comment = comment_at(buf, vim.fn.line("."))
+        local comment = comment_at(buf)
         if not comment then
                 notify("No comment on this line", vim.log.levels.WARN)
                 return
@@ -569,7 +661,7 @@ end
 
 function M.delete()
         local buf = api.nvim_get_current_buf()
-        local comment = comment_at(buf, vim.fn.line("."))
+        local comment = comment_at(buf)
         if not comment then
                 notify("No comment on this line", vim.log.levels.WARN)
                 return
@@ -643,6 +735,10 @@ function M.prev()
         jump(-1)
 end
 
+-- Added to the intro when the review has a span comment, so the agent can read its location.
+local SPAN_NOTE = " A location with columns (line:col-col, or line:col-line:col) is a span of text within those"
+        .. " lines, in 1-based character columns with the end inclusive; its quoted code is exactly that span."
+
 ---The whole review as markdown, or nil when there are no comments.
 function M.format(root)
         sync_all()
@@ -652,13 +748,16 @@ function M.format(root)
                 return nil
         end
         local out = { config.intro:format(#comments, root), "" }
+        local spans = false
         for i, comment in ipairs(comments) do
                 if comment.file == "" then
                         out[#out + 1] = ("## %d. General"):format(i)
                 else
-                        local range = comment.lnum == comment.end_lnum and tostring(comment.lnum)
-                                or ("%d-%d"):format(comment.lnum, comment.end_lnum)
-                        out[#out + 1] = ("## %d. %s:%s"):format(i, comment.file, range)
+                        out[#out + 1] = ("## %d. %s:%s"):format(i, comment.file, location(comment))
+                        if comment.col and not spans then
+                                spans = true
+                                out[1] = out[1] .. SPAN_NOTE
+                        end
                 end
                 local snippet = vim.list_slice(comment.snippet or {}, 1, config.max_snippet_lines)
                 if #snippet > 0 then
@@ -874,7 +973,7 @@ function M.list()
 end
 
 local actions = {
-        { "add", "Add a comment on the current line" },
+        { "add", "Add a comment on the current line or selection" },
         { "general", "Add a general comment, not tied to a line" },
         { "edit", "Edit the comment under the cursor" },
         { "delete", "Delete the comment under the cursor" },
@@ -894,11 +993,7 @@ end, actions)
 ---Pick one of the plugin's actions from a menu.
 function M.menu()
         -- Opening the menu ends visual mode, so remember the selection for "add".
-        local line1, line2
-        if vim.fn.mode():match("^[vV\22]") then
-                line1, line2 = vim.fn.line("v"), vim.fn.line(".")
-                api.nvim_feedkeys(vim.keycode("<Esc>"), "nx", false)
-        end
+        local line1, line2, col, end_col = take_selection()
         vim.ui.select(actions, {
                 prompt = "Monku",
                 format_item = function(action)
@@ -911,7 +1006,7 @@ function M.menu()
                 -- The picker hands control back before its window is fully closed.
                 vim.schedule(function()
                         if action[1] == "add" and line1 then
-                                M.add(line1, line2)
+                                M.add(line1, line2, col, end_col)
                         else
                                 M[action[1]]()
                         end
@@ -923,6 +1018,7 @@ local function set_highlights()
         api.nvim_set_hl(0, "MonkuSign", { fg = config.colors.sign })
         api.nvim_set_hl(0, "MonkuBorder", { fg = config.colors.border })
         api.nvim_set_hl(0, "MonkuText", { fg = config.colors.text })
+        api.nvim_set_hl(0, "MonkuSpan", { bg = config.colors.span })
 end
 
 function M.setup(opts)
@@ -983,7 +1079,18 @@ function M.setup(opts)
                 elseif not vim.list_contains(subcommands, sub) then
                         notify("Usage: Monku " .. table.concat(subcommands, "|"), vim.log.levels.ERROR)
                 elseif sub == "add" and cmd.range > 0 then
-                        M.add(cmd.line1, cmd.line2)
+                        -- `:'<,'>Monku add` only passes lines; recover the span of a characterwise selection.
+                        local p1, p2 = vim.fn.getpos("'<"), vim.fn.getpos("'>")
+                        if
+                                cmd.range == 2
+                                and vim.fn.visualmode() == "v"
+                                and p1[2] == cmd.line1
+                                and p2[2] == cmd.line2
+                        then
+                                M.add(span(api.nvim_get_current_buf(), p1, p2))
+                        else
+                                M.add(cmd.line1, cmd.line2)
+                        end
                 else
                         M[sub]()
                 end
