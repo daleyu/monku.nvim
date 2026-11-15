@@ -16,7 +16,11 @@ Leave review comments on code as you read it, then send them all to a coding age
 
 - **Neovim** >= 0.11
 - [herdr](https://herdr.dev) for `submit` _(optional)_
-- [snacks.nvim](https://github.com/folke/snacks.nvim) for the list picker _(optional)_
+- [snacks.nvim](https://github.com/folke/snacks.nvim) for pickers _(optional)_
+
+All menus and confirmations prefer Snacks directly, even when its global `vim.ui.select` override is
+disabled. If its selector is unavailable, they fall back to `vim.ui.select` (Neovim's numbered menu by
+default). The comment list also has a selection-menu fallback.
 
 ## 📦 Installation
 
@@ -74,6 +78,26 @@ Install with [lazy.nvim](https://github.com/folke/lazy.nvim):
 | `:Monku clear` | Delete all comments |
 | `:Monku delmarks` | Delete all Vim marks |
 
+### Writing a comment
+
+The comment editor is a small buffer under the code. Its text is the comment, and Vim's own commands work on it:
+
+| Key | Action |
+| --- | --- |
+| `<CR>` (normal mode), `<C-s>`, `:w`, `:wq`, `:x` | Save the comment and close the editor |
+| `q`, `<Esc>` (normal mode), `:q`, `:close`, `<C-w>c` | Close; if text would be lost, ask first |
+| `:q!`, `:close!` | Close and discard without asking |
+
+Text "would be lost" when a new comment is not blank, or an edited comment differs from the original; otherwise
+the editor just closes. The question, "Save this comment?", offers **Save**, **Discard** and **Keep editing**.
+Save is first, so accepting the Snacks picker straight away saves; in Neovim's numbered menu choose `1`.
+Dismissing the selection keeps editing. The force-close commands above discard without asking.
+
+Moving to another window leaves the editor open with its text, so nothing is asked. A close that is not typed
+or pressed in the editor itself (`:qa`, `:tabclose`, a mapping or plugin running `:close`) is refused by Vim
+with "No write since last change" while there is unsaved comment text.
+`:qa!` also discards unsaved editor text, and closing or killing Neovim does not save a draft automatically.
+
 ### Commenting on a selection
 
 What a comment is anchored to depends on how you select:
@@ -122,3 +146,9 @@ Reject a percent above 100 here rather than clamping the result
 
 The first two are spans and the third is a line comment; this is the output for the comments in the
 screenshot at the top.
+
+## Tests
+
+Run `python3 tests/run.py` for the isolated editor and selector regression suites, or add `--tui` to run
+them in a terminal UI. Add `--snacks /path/to/snacks.nvim` to also test the real Snacks picker. Tests use
+temporary projects and storage and do not change your comments or clipboard.

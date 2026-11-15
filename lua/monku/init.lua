@@ -53,6 +53,18 @@ local function notify(msg, level)
         vim.notify(msg, level or vim.log.levels.INFO, { title = "monku" })
 end
 
+-- Prefer Snacks even when its global vim.ui.select override is disabled. Resolve lazily so an optional
+-- or lazy-loaded Snacks installation does not become a dependency of Monku.
+local function select(items, opts, on_choice)
+        local ok, picker_select = pcall(function()
+                return require("snacks").picker.select
+        end)
+        if ok and type(picker_select) == "function" then
+                return picker_select(items, opts, on_choice)
+        end
+        return vim.ui.select(items, opts, on_choice)
+end
+
 -- Storage -------------------------------------------------------------------------------------------------
 
 local function realpath(path)
@@ -409,6 +421,9 @@ local MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT = 2, 15
 -- Open the comment editor. With `opts.line` it opens directly below that line of the current window, and the
 -- code underneath is pushed down to make room rather than covered. Without it (a general comment) it sits
 -- along the bottom edge of the window. Either way it starts small and grows with the text.
+--
+-- The editor is a writable buffer whose "file" is the comment, so Vim's own commands apply: `:w` saves it,
+-- and closing it with unsaved text (`q`, `:q`, `<C-w>c`, ...) asks whether to save, discard or keep editing.
 local function open_input(opts)
         local src_win = api.nvim_get_current_win()
         local src_buf = api.nvim_get_current_buf()
@@ -419,6 +434,8 @@ local function open_input(opts)
 
         local buf = api.nvim_create_buf(false, true)
         vim.bo[buf].bufhidden = "wipe"
+        vim.bo[buf].buftype = "acwrite"
+        api.nvim_buf_set_name(buf, "monku://comment")
         vim.b[buf].completion = false
         if opts.initial then
                 api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(opts.initial, "\n", { plain = true }))
@@ -432,7 +449,7 @@ local function open_input(opts)
                 style = "minimal",
                 border = "rounded",
                 title = " " .. opts.title .. " ",
-                footer = " <C-s> or <CR> save · q cancel ",
+                footer = " <CR> or :w save · q or :q close ",
         }
         local line_height, spacer = 1, nil
         if line then
@@ -491,15 +508,32 @@ local function open_input(opts)
                         api.nvim_win_set_height(win, height)
                 end
         end
-        api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, { buffer = buf, callback = fit })
+
+        local function current_text()
+                return vim.trim(table.concat(api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
+        end
+        -- 'modified' means "closing now would lose something": not so for a blank new comment or an
+        -- unchanged edit.
+        local function track()
+                vim.bo[buf].modified = current_text() ~= vim.trim(opts.initial or "")
+        end
+        api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
+                buffer = buf,
+                callback = function()
+                        track()
+                        fit()
+                end,
+        })
+        track()
         fit()
 
-        local closed = false
+        local closed, guard, asking = false, nil, false
         local function close()
                 if closed then
                         return
                 end
                 closed = true
+                api.nvim_del_autocmd(guard)
                 vim.cmd.stopinsert()
                 if api.nvim_win_is_valid(win) then
                         api.nvim_win_close(win, true)
@@ -517,20 +551,84 @@ local function open_input(opts)
                         end
                 end
         end
-        local function save()
-                local text = vim.trim(table.concat(api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
+        local function finish(text)
+                if closed then
+                        return
+                end
                 close()
                 if text ~= "" then
                         opts.on_submit(text)
                 end
         end
+        local function save()
+                finish(current_text())
+        end
+        -- Vim may close (and wipe) the editor during `:wq` or `:x`. Capture the text before that happens;
+        -- submission must still run even if WinClosed has already cleaned up the editor.
+        api.nvim_create_autocmd("BufWriteCmd", {
+                buffer = buf,
+                callback = function()
+                        local text = current_text()
+                        vim.bo[buf].modified = false
+                        vim.schedule(function()
+                                close()
+                                if text ~= "" then
+                                        opts.on_submit(text)
+                                end
+                        end)
+                end,
+        })
+        -- Close, but ask first if that would throw text away.
+        local function quit()
+                if closed or asking then
+                        return
+                end
+                track()
+                if not vim.bo[buf].modified then
+                        return close()
+                end
+                -- "Save" comes first so that it is the default: accepting the picker as it opens saves.
+                asking = true
+                select({ "Save", "Discard", "Keep editing" }, { prompt = "Save this comment?" }, function(choice)
+                        -- The picker hands control back before its window is fully closed.
+                        vim.schedule(function()
+                                asking = false
+                                if closed then
+                                        return
+                                elseif choice == "Save" then
+                                        save()
+                                elseif choice == "Discard" then
+                                        close()
+                                end
+                        end)
+                end)
+        end
+        -- Vim refuses to close a modified buffer with an error (E37), so a typed `:q` or `:close` is
+        -- cancelled before it runs and asked about instead. With a `!` they go through and discard.
+        guard = api.nvim_create_autocmd("CmdlineLeave", {
+                pattern = ":",
+                callback = function()
+                        local cmd = vim.fn.getcmdline():match("^[%s:]*(%a+)%s*$")
+                        if vim.v.event.abort or api.nvim_get_current_buf() ~= buf or not cmd then
+                                return
+                        end
+                        if vim.startswith("quit", cmd) or (#cmd >= 3 and vim.startswith("close", cmd)) then
+                                -- `vim.v.event` is a copy in Lua, so this has to be set from Vimscript.
+                                vim.cmd("let v:event.abort = v:true")
+                                vim.schedule(quit)
+                        end
+                end,
+        })
         -- Clean up even if the window is closed some other way (:q, <C-w>c, ...).
         api.nvim_create_autocmd("WinClosed", { pattern = tostring(win), once = true, callback = close })
 
         vim.keymap.set({ "n", "i" }, "<C-s>", save, { buffer = buf })
         vim.keymap.set("n", "<CR>", save, { buffer = buf })
-        vim.keymap.set("n", "q", close, { buffer = buf })
-        vim.keymap.set("n", "<Esc>", close, { buffer = buf })
+        vim.keymap.set("n", "q", quit, { buffer = buf })
+        vim.keymap.set("n", "<Esc>", quit, { buffer = buf })
+        for _, lhs in ipairs({ "<C-w>c", "<C-w>q", "<C-w><C-q>" }) do
+                vim.keymap.set("n", lhs, quit, { buffer = buf })
+        end
         if opts.initial then
                 vim.cmd.startinsert({ bang = true })
         else
@@ -676,9 +774,13 @@ function M.clear()
                 notify("No comments to clear")
                 return
         end
-        if vim.fn.confirm(("Delete all %d review comment(s)?"):format(count), "&Yes\n&No", 2) == 1 then
-                remove_all(root)
-        end
+        select({ "Keep comments", "Delete" }, {
+                prompt = ("Delete all %d review comment(s)?"):format(count),
+        }, function(choice)
+                if choice == "Delete" then
+                        remove_all(root)
+                end
+        end)
 end
 
 ---Toggle showing every comment in full, instead of only the one under the cursor.
@@ -813,7 +915,7 @@ local function pick_agent(on_choice)
         elseif #agents == 1 then
                 on_choice(agents[1])
         else
-                vim.ui.select(agents, {
+                select(agents, {
                         prompt = "Send review to",
                         format_item = function(agent)
                                 return ("%s %s [%s] %s"):format(
@@ -895,17 +997,36 @@ function M.list()
                 notify("No review comments yet")
                 return
         end
-        local ok, snacks = pcall(require, "snacks")
-        if not ok or not snacks.picker then
-                local qf = {}
-                for _, item in ipairs(items) do
-                        qf[#qf + 1] = { filename = item.file, lnum = item.pos and item.pos[1], text = item.comment }
-                end
-                vim.fn.setqflist({}, " ", { title = "Review comments", items = qf })
-                vim.cmd.copen()
+        local ok, picker = pcall(function()
+                return require("snacks").picker
+        end)
+        if not ok or not picker or type(picker.pick) ~= "function" then
+                select(items, {
+                        prompt = "Review comments",
+                        format_item = function(item)
+                                return item.label .. "  " .. item.comment
+                        end,
+                }, function(item)
+                        if not item then
+                                return
+                        end
+                        vim.schedule(function()
+                                if item.file then
+                                        vim.cmd.edit(vim.fn.fnameescape(item.file))
+                                        api.nvim_win_set_cursor(0, item.pos)
+                                else
+                                        for _, comment in ipairs(load_store(root).comments) do
+                                                if comment.id == item.comment_id then
+                                                        edit_comment(root, comment)
+                                                        break
+                                                end
+                                        end
+                                end
+                        end)
+                end)
                 return
         end
-        snacks.picker.pick({
+        picker.pick({
                 title = "Review comments",
                 finder = function()
                         return list_items(root)
@@ -927,7 +1048,7 @@ function M.list()
                                 ctx.preview:set_lines(wrap(ctx.item.comment_text, math.max(20, width)))
                                 return
                         end
-                        local ret = snacks.picker.preview.file(ctx)
+                        local ret = picker.preview.file(ctx)
                         local pbuf, pwin = ctx.preview.win.buf, ctx.preview.win.win
                         if not (pbuf and pwin and api.nvim_buf_is_valid(pbuf) and api.nvim_win_is_valid(pwin)) then
                                 return ret
@@ -994,7 +1115,7 @@ end, actions)
 function M.menu()
         -- Opening the menu ends visual mode, so remember the selection for "add".
         local line1, line2, col, end_col = take_selection()
-        vim.ui.select(actions, {
+        select(actions, {
                 prompt = "Monku",
                 format_item = function(action)
                         return ("%-8s %s"):format(action[1], action[2])
