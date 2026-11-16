@@ -53,7 +53,7 @@ Install with [lazy.nvim](https://github.com/folke/lazy.nvim):
 {
   herdr_bin = vim.env.HERDR_BIN_PATH or "herdr",
   auto_expand = true, -- show a comment inline while the cursor is on its line
-  clear_on_submit = true, -- drop the comments once the agent has accepted them
+  clear_on_submit = true, -- drop the comments once the agent has started on them
   sign = "▍",
   -- sign, border and text are foreground colors; span is the background behind a commented span
   colors = { sign = "#7287b8", border = "#7287b8", text = "#8c9bc4", span = "#333850" },
@@ -77,6 +77,18 @@ Install with [lazy.nvim](https://github.com/folke/lazy.nvim):
 | `:Monku submit` | Send all comments to the agent |
 | `:Monku clear` | Delete all comments |
 | `:Monku delmarks` | Delete all Vim marks |
+
+### Submitting
+
+`submit` sends the review to the agent in the current Herdr workspace (or asks which one, if there are several)
+without blocking the editor. Herdr reporting the prompt as sent is not enough: an idle agent can leave it in its
+input box. So unless the agent is already working (it queues the prompt), Monku waits up to 6 seconds for it to
+start working or ask a question, and if it stalls presses Enter once more and waits another 3 seconds. Only then
+are the submitted comments cleared (with `clear_on_submit`); comments added or edited meanwhile are kept. If the
+agent never starts, an error is shown and every comment is kept.
+
+Every submission is also saved to `stdpath("state")/monku/submitted/<UTC time>.md`, and the latest to
+`last-submitted.md` beside it.
 
 ### Writing a comment
 
@@ -149,6 +161,7 @@ screenshot at the top.
 
 ## Tests
 
-Run `python3 tests/run.py` for the isolated editor and selector regression suites, or add `--tui` to run
+Run `python3 tests/run.py` for the isolated editor, selector and submit regression suites (submit runs against
+the stand-in `tests/fake-herdr`, never a real agent), or add `--tui` to run
 them in a terminal UI. Add `--snacks /path/to/snacks.nvim` to also test the real Snacks picker. Tests use
 temporary projects and storage and do not change your comments or clipboard.

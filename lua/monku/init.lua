@@ -933,37 +933,119 @@ local function pick_agent(on_choice)
         end
 end
 
----Send every comment to an agent in the current Herdr workspace.
+-- Run a Herdr command without blocking the editor; `on_exit(ok, result)` runs on the main loop, where `result`
+-- is the decoded JSON reply (or nil) and `code`/`message` describe a failure.
+local function herdr(args, on_exit)
+        local cmd = vim.list_extend({ config.herdr_bin }, args)
+        local ok, err = pcall(vim.system, cmd, { text = true }, function(res)
+                local decoded, data = pcall(vim.json.decode, res.stdout)
+                data = decoded and type(data) == "table" and data or {}
+                vim.schedule(function()
+                        on_exit(res.code == 0, {
+                                code = vim.tbl_get(data, "error", "code"),
+                                message = vim.tbl_get(data, "error", "message") or vim.trim(res.stdout .. res.stderr),
+                        })
+                end)
+        end)
+        if not ok then
+                vim.schedule(function()
+                        on_exit(false, { message = tostring(err) })
+                end)
+        end
+end
+
+-- Keep every submission, so a review is never lost even if the agent never picks it up. Returns the path.
+local function archive_submission(text)
+        local dir = vim.fn.stdpath("state") .. "/monku"
+        local lines = vim.split(text, "\n", { plain = true })
+        vim.fn.mkdir(dir .. "/submitted", "p")
+        vim.fn.writefile(lines, dir .. "/last-submitted.md")
+        local stamp = os.date("!%Y%m%dT%H%M%SZ")
+        local path, n = ("%s/submitted/%s.md"):format(dir, stamp), 1
+        while vim.uv.fs_stat(path) do
+                n = n + 1
+                path = ("%s/submitted/%s-%d.md"):format(dir, stamp, n)
+        end
+        vim.fn.writefile(lines, path)
+        return path
+end
+
+local STALLED = { agent_prompt_stalled = true, timeout = true }
+
+-- Deliver `text` to `agent`, then call `on_done(true)` once the agent has visibly taken it, or
+-- `on_done(false, reason)`. Herdr's "ok" only means the text and Enter were written, and an idle agent can
+-- swallow the Enter, leaving the review sitting in its input box. So unless the agent is already working
+-- (it will queue the prompt), wait for it to start working, and if it stalls press Enter once more.
+local function deliver(agent, text, on_done)
+        local pane = agent.pane_id
+        if agent.agent_status == "working" then
+                return herdr({ "agent", "prompt", pane, text }, function(ok, res)
+                        on_done(ok, res.message)
+                end)
+        end
+        local started = { "--until", "working", "--until", "blocked" }
+        herdr(
+                vim.list_extend({ "agent", "prompt", pane, text, "--wait", "--timeout", "6000" }, started),
+                function(ok, res)
+                        if ok or not STALLED[res.code] then
+                                return on_done(ok, res.message)
+                        end
+                        herdr({ "agent", "send-keys", pane, "enter" }, function(sent, keys)
+                                if not sent then
+                                        return on_done(false, "the prompt stalled and Enter failed: " .. keys.message)
+                                end
+                                herdr(
+                                        vim.list_extend({ "agent", "wait", pane, "--timeout", "3000" }, started),
+                                        function(started_ok, wait)
+                                                local why = "the prompt stalled after a retried Enter: " .. wait.message
+                                                on_done(started_ok, why)
+                                        end
+                                )
+                        end)
+                end
+        )
+end
+
+local submitting = false
+
+---Send every comment to an agent in the current Herdr workspace. The comments are cleared only once the agent
+---has started working on them; every submission is also archived under stdpath("state")/monku/submitted.
 function M.submit()
+        if submitting then
+                notify("A review is still being submitted", vim.log.levels.WARN)
+                return
+        end
         local root = current_root()
         local text, count = M.format(root)
         if not text then
                 notify("No comments to submit", vim.log.levels.WARN)
                 return
         end
+        -- Clear only what was sent, as it was sent: comments added or edited while waiting are kept.
+        local sent = {}
+        for _, comment in ipairs(load_store(root).comments) do
+                sent[comment.id] = comment.text
+        end
         pick_agent(function(agent)
-                local res = vim.system({ config.herdr_bin, "agent", "prompt", agent.pane_id, text }, { text = true })
-                        :wait()
-                if res.code ~= 0 then
-                        local decoded, data = pcall(vim.json.decode, res.stdout)
-                        local reason = decoded and vim.tbl_get(data, "error", "message")
-                                or vim.trim(res.stdout .. res.stderr)
-                        notify(
-                                ("Herdr did not deliver the review (%s). Comments kept."):format(reason),
-                                vim.log.levels.ERROR
-                        )
-                        return
-                end
-
-                -- Keep the last submission around in case the agent never picks it up.
-                local archive = vim.fn.stdpath("state") .. "/monku/last-submitted.md"
-                vim.fn.mkdir(vim.fs.dirname(archive), "p")
-                vim.fn.writefile(vim.split(text, "\n", { plain = true }), archive)
-
-                if config.clear_on_submit then
-                        remove_all(root)
-                end
-                notify(("Sent %d comment(s) to %s (%s)"):format(count, agent.agent, agent.pane_id))
+                submitting = true
+                local archive = archive_submission(text)
+                deliver(agent, text, function(ok, reason)
+                        submitting = false
+                        if not ok then
+                                local msg = "Herdr did not deliver the review to %s (%s): %s. "
+                                        .. "Comments kept; a copy is in %s"
+                                notify(msg:format(agent.agent, agent.pane_id, reason, archive), vim.log.levels.ERROR)
+                                return
+                        end
+                        if config.clear_on_submit then
+                                for _, comment in ipairs(vim.list_extend({}, load_store(root).comments)) do
+                                        if sent[comment.id] == comment.text then
+                                                remove(root, comment.id)
+                                        end
+                                end
+                        end
+                        notify(("Sent %d comment(s) to %s (%s)"):format(count, agent.agent, agent.pane_id))
+                end)
         end)
 end
 

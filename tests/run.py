@@ -13,7 +13,8 @@ import time
 
 def run(suite, tui, snacks):
     repo = Path(__file__).resolve().parent.parent
-    with tempfile.TemporaryDirectory(prefix="monku-test-") as tmp:
+    # Resolve symlinks (macOS /var -> /private/var) so the suites' stdpath-under-cwd checks hold.
+    with tempfile.TemporaryDirectory(prefix="monku-test-", dir=os.path.realpath(tempfile.gettempdir())) as tmp:
         env = dict(os.environ, REPO=str(repo), OUT="results.txt", TERM="xterm-256color")
         for kind in ("DATA", "STATE", "CACHE", "CONFIG"):
             env[f"XDG_{kind}_HOME"] = f"{tmp}/{kind.lower()}"
@@ -65,5 +66,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     run("selectors", args.tui, None)
     run("editor", args.tui, None)
+    run("submit", args.tui, None)
     if args.snacks:
         run("snacks", True, args.snacks)
