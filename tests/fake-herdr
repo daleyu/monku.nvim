@@ -1,9 +1,17 @@
 #!/bin/sh
 # Stand-in for herdr in tests/submit.lua. $FAKE_HERDR_DIR/status is the agent's status, and
-# $FAKE_HERDR_DIR/<subcommand> (prompt, send-keys, wait) holds that command's reply: "ok", an error code, or
-# "sleep" (ok after a pause). Every call is appended to $FAKE_HERDR_DIR/calls, with a prompt's text elided.
+# $FAKE_HERDR_DIR/<subcommand> (prompt, send-keys, wait) holds that command's reply: "ok", an error code
+# (written to stderr as JSON, like herdr), or "sleep" (ok after a pause). $FAKE_HERDR_DIR/read holds one reply
+# per `pane read` call, consumed in order: "delivered" (the prompt echoed above an empty input box), "pasted"
+# or "inline" (the prompt still in the input box, collapsed or as text), or an error code. Every call is
+# appended to $FAKE_HERDR_DIR/calls, with a prompt's text elided.
 dir=$FAKE_HERDR_DIR
+fail() {
+        printf '{"error":{"code":"%s","message":"fake %s"}}\n' "$1" "$1" >&2
+        exit 1
+}
 if [ "$2" = prompt ]; then
+        printf '%s' "$4" >"$dir/last-prompt"
         cmd="$1 $2 $3"
         shift 4
         echo "$cmd <text>${*:+ $*}" >>"$dir/calls"
@@ -15,9 +23,22 @@ if [ "$2" = list ]; then
         printf '{"result":{"agents":[{"agent":"claude","pane_id":"t:p1","agent_status":"%s"}]}}\n' "$(cat "$dir/status")"
         exit 0
 fi
+if [ "$2" = read ]; then
+        reply=$(head -n 1 "$dir/read")
+        tail -n +2 "$dir/read" >"$dir/read.rest" && mv "$dir/read.rest" "$dir/read"
+        rule=──────────────────────────────────────────────────
+        first=$(head -n 1 "$dir/last-prompt")
+        case $reply in
+        delivered) printf '❯ %s\n  more\n\n✻ Working…\n\n%s\n❯ \n%s\n  status line ────── 0%%\n' "$first" "$rule" "$rule" ;;
+        pasted) printf '%s\n❯ [Pasted text #1 +%d lines]\n%s\n  status line\n' "$rule" "$(wc -l <"$dir/last-prompt")" "$rule" ;;
+        inline) printf '%s\n❯ %s\n  more\n%s\n  status line\n' "$rule" "$first" "$rule" ;;
+        *) fail "$reply" ;;
+        esac
+        exit 0
+fi
 reply=$(cat "$dir/$2" 2>/dev/null || echo ok)
 case $reply in
 ok) echo '{"result":{}}' ;;
 sleep) sleep 0.3 && echo '{"result":{}}' ;;
-*) printf '{"error":{"code":"%s","message":"fake %s"}}\n' "$reply" "$reply" && exit 1 ;;
+*) fail "$reply" ;;
 esac

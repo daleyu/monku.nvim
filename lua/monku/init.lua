@@ -934,16 +934,21 @@ local function pick_agent(on_choice)
 end
 
 -- Run a Herdr command without blocking the editor; `on_exit(ok, result)` runs on the main loop, where `result`
--- is the decoded JSON reply (or nil) and `code`/`message` describe a failure.
-local function herdr(args, on_exit)
+-- has the command's `stdout`, and `code`/`message` describe a failure (Herdr writes its JSON errors to stderr).
+-- `timeout` (ms) kills a command that has not finished.
+local function herdr(args, on_exit, timeout)
         local cmd = vim.list_extend({ config.herdr_bin }, args)
-        local ok, err = pcall(vim.system, cmd, { text = true }, function(res)
-                local decoded, data = pcall(vim.json.decode, res.stdout)
+        local ok, err = pcall(vim.system, cmd, { text = true, timeout = timeout }, function(res)
+                local decoded, data = pcall(vim.json.decode, res.code == 0 and res.stdout or res.stderr)
                 data = decoded and type(data) == "table" and data or {}
+                local output = vim.trim(res.stdout .. res.stderr)
                 vim.schedule(function()
                         on_exit(res.code == 0, {
+                                stdout = res.stdout,
                                 code = vim.tbl_get(data, "error", "code"),
-                                message = vim.tbl_get(data, "error", "message") or vim.trim(res.stdout .. res.stderr),
+                                message = vim.tbl_get(data, "error", "message")
+                                        or (output == "" and res.code == 124 and "timed out")
+                                        or output,
                         })
                 end)
         end)
@@ -971,16 +976,81 @@ local function archive_submission(text)
 end
 
 local STALLED = { agent_prompt_stalled = true, timeout = true }
+local SETTLE_MS = 700
+local RULE = ("─"):rep(10)
+
+-- Claude Code draws its input box as `❯ <draft>` between two full-width rules of `─`, with status lines
+-- below it; a pasted multi-line draft shows as `[Pasted text #N +K lines]`, K being its newline count.
+-- Return the box's text with whitespace collapsed, or nil if `screen` has no box.
+local function input_box(screen)
+        local rules = {}
+        local lines = vim.split(screen, "\n", { plain = true })
+        for i, line in ipairs(lines) do
+                local rule = vim.trim(line)
+                if rule:sub(1, #RULE) == RULE and rule:gsub("─", "") == "" then
+                        rules[#rules + 1] = i
+                end
+        end
+        if #rules < 2 then
+                return nil
+        end
+        local box = table.concat(vim.list_slice(lines, rules[#rules - 1] + 1, rules[#rules] - 1), " ")
+        return vim.trim((box:gsub("\194\160", " "):gsub("^%s*❯", ""):gsub("%s+", " ")))
+end
+
+-- Whether Claude Code's input box still holds `text`, collapsed or as typed (its first 40 characters).
+local function holds(box, text)
+        local _, newlines = text:gsub("\n", "")
+        for n in box:gmatch("%[Pasted text #%d+ %+(%d+) lines?%]") do
+                if math.abs(tonumber(n) - newlines) <= 1 then
+                        return true
+                end
+        end
+        local first = vim.fn.strcharpart((vim.trim(text:match("[^\n]*")):gsub("%s+", " ")), 0, 40)
+        return first ~= "" and box:find(first, 1, true) ~= nil
+end
+
+-- After a short settle, read the bottom of the pane and call `on_done(true)` if `text` has left Claude Code's
+-- input box (it was submitted or queued). If it is still there, press Enter once more and check again.
+local function confirm_left_box(pane, text, retried, on_done)
+        vim.defer_fn(function()
+                herdr({ "pane", "read", pane, "--source", "detection" }, function(ok, res)
+                        if not ok then
+                                return on_done(false, "could not read the agent's screen: " .. res.message)
+                        end
+                        local box = input_box(res.stdout)
+                        if not box then
+                                return on_done(false, "could not find the agent's input box")
+                        elseif not holds(box, text) then
+                                return on_done(true)
+                        elseif retried then
+                                return on_done(false, "the prompt is still in the input box after a retried Enter")
+                        end
+                        herdr({ "agent", "send-keys", pane, "enter" }, function(sent, keys)
+                                if not sent then
+                                        local why = "the prompt stuck in the input box and Enter failed: "
+                                        return on_done(false, why .. keys.message)
+                                end
+                                confirm_left_box(pane, text, true, on_done)
+                        end)
+                end, 3000)
+        end, SETTLE_MS)
+end
 
 -- Deliver `text` to `agent`, then call `on_done(true)` once the agent has visibly taken it, or
--- `on_done(false, reason)`. Herdr's "ok" only means the text and Enter were written, and an idle agent can
--- swallow the Enter, leaving the review sitting in its input box. So unless the agent is already working
--- (it will queue the prompt), wait for it to start working, and if it stalls press Enter once more.
+-- `on_done(false, reason)`. Herdr's "ok" only means the text and Enter were written, and the agent can
+-- swallow the Enter, leaving the review sitting in its input box. An idle agent must start working or ask a
+-- question; if it stalls, press Enter once more. A working agent queues the prompt, but Herdr also reports
+-- Claude Code as working while it waits for background agents at an idle prompt, so for Claude check that the
+-- text has left the input box instead.
 local function deliver(agent, text, on_done)
         local pane = agent.pane_id
         if agent.agent_status == "working" then
                 return herdr({ "agent", "prompt", pane, text }, function(ok, res)
-                        on_done(ok, res.message)
+                        if not ok or agent.agent ~= "claude" then
+                                return on_done(ok, res.message)
+                        end
+                        confirm_left_box(pane, text, false, on_done)
                 end)
         end
         local started = { "--until", "working", "--until", "blocked" }

@@ -81,11 +81,20 @@ Install with [lazy.nvim](https://github.com/folke/lazy.nvim):
 ### Submitting
 
 `submit` sends the review to the agent in the current Herdr workspace (or asks which one, if there are several)
-without blocking the editor. Herdr reporting the prompt as sent is not enough: an idle agent can leave it in its
-input box. So unless the agent is already working (it queues the prompt), Monku waits up to 6 seconds for it to
-start working or ask a question, and if it stalls presses Enter once more and waits another 3 seconds. Only then
-are the submitted comments cleared (with `clear_on_submit`); comments added or edited meanwhile are kept. If the
-agent never starts, an error is shown and every comment is kept.
+without blocking the editor. Herdr reporting the prompt as sent is not enough: the agent can leave it in its
+input box. So Monku confirms delivery before clearing anything:
+
+- An idle agent must start working or ask a question within 6 seconds. If it stalls, Monku presses Enter once
+  more and waits another 3 seconds.
+- A working agent queues the prompt, but Herdr also reports Claude Code as working while it waits for
+  background agents at an idle prompt. So for Claude, Monku reads the bottom of the pane
+  (`herdr pane read --source detection`) after a short pause and checks that the review has left Claude's
+  input box (shown there as `[Pasted text #N +K lines]` or as its first line). If it is still there, Monku
+  presses Enter once more and checks again. Other agents that are working are trusted to queue it.
+
+Only then are the submitted comments cleared (with `clear_on_submit`); comments added or edited meanwhile are
+kept. If delivery cannot be confirmed (the agent never starts, the review stays in the input box, or the screen
+cannot be read), an error is shown and every comment is kept.
 
 Every submission is also saved to `stdpath("state")/monku/submitted/<UTC time>.md`, and the latest to
 `last-submitted.md` beside it.

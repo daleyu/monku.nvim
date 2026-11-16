@@ -24,12 +24,14 @@ vim.notify = function(msg, level)
 end
 local archive = vim.fn.stdpath("state") .. "/monku"
 
--- Submit one comment with the fake agent in `status` and the given replies; return the herdr calls made.
+-- Submit one comment with the fake agent in `status` and the given replies (`read` is a list, one per screen
+-- read); return the herdr calls made.
 local function submit(name, status, replies, during)
         vim.fn.writefile({ status }, dir .. "/status")
         for _, cmd in ipairs({ "prompt", "send-keys", "wait" }) do
                 vim.fn.writefile({ replies[cmd] or "ok" }, dir .. "/" .. cmd)
         end
+        vim.fn.writefile(replies.read or {}, dir .. "/read")
         vim.fn.delete(dir .. "/calls")
         notes = {}
         monku.create(source, 2, 2, name)
@@ -44,10 +46,25 @@ local function submit(name, status, replies, during)
 end
 
 local WAIT = " --wait --timeout 6000 --until working --until blocked"
-local calls, note = submit("busy", "working", {})
-eq("working agent: plain prompt, Claude queues it", calls, { "agent list", "agent prompt t:p1 <text>" })
-eq("working agent: cleared", monku.format(), nil)
+local READ = "pane read t:p1 --source detection"
+local calls, note = submit("busy", "working", { read = { "delivered" } })
+eq("working agent: plain prompt, then the input box is checked", calls, {
+        "agent list",
+        "agent prompt t:p1 <text>",
+        READ,
+})
+eq("working agent: echoed above an empty box counts as delivered", monku.format(), nil)
 eq("working agent: reported", note.msg:find("Sent 1 comment", 1, true) ~= nil, true)
+
+calls = submit("busy but stuck", "working", { read = { "pasted", "delivered" } })
+eq("stuck in the box: one more Enter, then check again", calls, {
+        "agent list",
+        "agent prompt t:p1 <text>",
+        READ,
+        "agent send-keys t:p1 enter",
+        READ,
+})
+eq("stuck then delivered: cleared", monku.format(), nil)
 
 calls = submit("idle ok", "idle", {})
 eq("idle agent: waits until it starts", calls, { "agent list", "agent prompt t:p1 <text>" .. WAIT })
@@ -76,6 +93,24 @@ eq("blocked: no retry", #calls, 2)
 eq("blocked: error", note.level, vim.log.levels.ERROR)
 eq("blocked: both comments kept", select(2, monku.format()), 2)
 
+calls, note = submit("busy and still stuck", "working", { read = { "inline", "pasted" } })
+eq("still stuck: only one retry", calls, {
+        "agent list",
+        "agent prompt t:p1 <text>",
+        READ,
+        "agent send-keys t:p1 enter",
+        READ,
+})
+eq("still stuck: error", note.level, vim.log.levels.ERROR)
+eq("still stuck: error says why", note.msg:find("still in the input box", 1, true) ~= nil, true)
+eq("still stuck: comments kept", select(2, monku.format()), 3)
+
+calls, note = submit("unreadable", "working", { read = { "pane_not_found" } })
+eq("read error: no retry", #calls, 3)
+eq("read error: error", note.level, vim.log.levels.ERROR)
+eq("read error: Herdr's message is shown", note.msg:find("fake pane_not_found", 1, true) ~= nil, true)
+eq("read error: comments kept", select(2, monku.format()), 4)
+
 -- Keep the two leftovers, submit them plus a third, and add a fourth while Herdr is still waiting.
 submit("slow", "idle", { prompt = "sleep" }, function()
         monku.submit()
@@ -88,7 +123,7 @@ eq("only the submitted comments are cleared", count, 1)
 eq("the comment added while waiting is kept", text:find("added while waiting", 1, true) ~= nil, true)
 
 local files = vim.fn.glob(archive .. "/submitted/*.md", false, true)
-eq("every submission is archived", #files, 7)
+eq("every submission is archived", #files, 10)
 local last = vim.fn.readfile(archive .. "/last-submitted.md")
 eq("last-submitted.md is the latest submission", table.concat(last, "\n"):find("slow", 1, true) ~= nil, true)
 eq("and is archived too", #vim.tbl_filter(function(f)
