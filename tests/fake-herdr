@@ -1,0 +1,23 @@
+#!/bin/sh
+# Stand-in for herdr in tests/submit.lua. $FAKE_HERDR_DIR/status is the agent's status, and
+# $FAKE_HERDR_DIR/<subcommand> (prompt, send-keys, wait) holds that command's reply: "ok", an error code, or
+# "sleep" (ok after a pause). Every call is appended to $FAKE_HERDR_DIR/calls, with a prompt's text elided.
+dir=$FAKE_HERDR_DIR
+if [ "$2" = prompt ]; then
+        cmd="$1 $2 $3"
+        shift 4
+        echo "$cmd <text>${*:+ $*}" >>"$dir/calls"
+        set -- agent prompt
+else
+        echo "$*" >>"$dir/calls"
+fi
+if [ "$2" = list ]; then
+        printf '{"result":{"agents":[{"agent":"claude","pane_id":"t:p1","agent_status":"%s"}]}}\n' "$(cat "$dir/status")"
+        exit 0
+fi
+reply=$(cat "$dir/$2" 2>/dev/null || echo ok)
+case $reply in
+ok) echo '{"result":{}}' ;;
+sleep) sleep 0.3 && echo '{"result":{}}' ;;
+*) printf '{"error":{"code":"%s","message":"fake %s"}}\n' "$reply" "$reply" && exit 1 ;;
+esac
